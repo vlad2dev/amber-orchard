@@ -193,22 +193,106 @@ pub fn number(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
+    // Eighteen decimal digits always fit in i64.
     let mut n = 0_i64;
-    for &c in s {
-        let digit = c.wrapping_sub(b'0');
-        if digit > 9 {
-            return None;
+    if s.len() <= 18 {
+        for &c in s {
+            let digit = c.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            n = n * 10 + i64::from(digit);
         }
-        n = n.checked_mul(10)?.checked_add(i64::from(digit))?;
+    } else {
+        for &c in s {
+            let digit = c.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            n = n.checked_mul(10)?.checked_add(i64::from(digit))?;
+        }
     }
     Some(n)
 }
 
 #[inline]
-fn two(s: &[u8], index: usize) -> Option<i64> {
+fn two(s: &[u8], index: usize) -> Option<i32> {
     let a = s[index].wrapping_sub(b'0');
     let b = s[index + 1].wrapping_sub(b'0');
-    (a <= 9 && b <= 9).then_some(i64::from(a) * 10 + i64::from(b))
+    (a <= 9 && b <= 9).then_some(i32::from(a) * 10 + i32::from(b))
+}
+
+const fn month_start(year: i32, month: i32) -> i32 {
+    let year = year - (month <= 2) as i32;
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let march_month = if month > 2 { month - 3 } else { month + 9 };
+    era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
+        + (153 * march_month + 2) / 5
+        - 719_468
+}
+
+const fn calendar() -> [[i32; 13]; 10_000] {
+    let mut table = [[0; 13]; 10_000];
+    let mut year = 0;
+    while year < 10_000 {
+        let mut month = 1;
+        while month <= 12 {
+            let start = month_start(year as i32, month as i32);
+            let next = if month == 12 {
+                month_start(year as i32 + 1, 1)
+            } else {
+                month_start(year as i32, month as i32 + 1)
+            };
+            table[year][month] = (start << 5) | (next - start);
+            month += 1;
+        }
+        year += 1;
+    }
+    table
+}
+
+static CALENDAR: [[i32; 13]; 10_000] = calendar();
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline]
+fn civil_digits(s: &[u8]) -> Option<[i32; 6]> {
+    use std::arch::x86_64::*;
+
+    // The input is at least 20 bytes. The shuffle removes the separators and
+    // the final two digits are parsed by two() below.
+    let pairs = unsafe {
+        let raw = _mm_loadu_si128(s.as_ptr().cast());
+        let order = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1);
+        let digits = _mm_sub_epi8(_mm_shuffle_epi8(raw, order), _mm_set1_epi8(b'0' as i8));
+        let valid = _mm_cmpeq_epi8(digits, _mm_min_epu8(digits, _mm_set1_epi8(9)));
+        if _mm_movemask_epi8(valid) & 0xfff != 0xfff {
+            return None;
+        }
+        _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a))
+    };
+    Some(unsafe {
+        [
+            _mm_extract_epi16::<0>(pairs) * 100 + _mm_extract_epi16::<1>(pairs),
+            _mm_extract_epi16::<2>(pairs),
+            _mm_extract_epi16::<3>(pairs),
+            _mm_extract_epi16::<4>(pairs),
+            _mm_extract_epi16::<5>(pairs),
+            two(s, 17)?,
+        ]
+    })
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+fn civil_digits(s: &[u8]) -> Option<[i32; 6]> {
+    Some([
+        two(s, 0)? * 100 + two(s, 2)?,
+        two(s, 5)?,
+        two(s, 8)?,
+        two(s, 11)?,
+        two(s, 14)?,
+        two(s, 17)?,
+    ])
 }
 
 pub fn timestamp(s: &[u8]) -> Option<i64> {
@@ -224,35 +308,22 @@ pub fn timestamp(s: &[u8]) -> Option<i64> {
             if hour > 23 || minute > 59 {
                 return None;
             }
-            (hour * 60 + minute) * 60_000 * if sign == b'+' { 1 } else { -1 }
+            (hour * 60 + minute) * 60 * if sign == b'+' { 1 } else { -1 }
         }
         _ => return None,
     };
     if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
-    let year = two(s, 0)? * 100 + two(s, 2)?;
-    let month = two(s, 5)?;
-    let date = two(s, 8)?;
-    let hour = two(s, 11)?;
-    let minute = two(s, 14)?;
-    let second = two(s, 17)?;
-    const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let max_date = *MONTH_DAYS.get((month - 1) as usize)?
-        + i64::from(month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-    if date == 0 || date > max_date || hour > 23 || minute > 59 || second > 59 {
+
+    let [year, month, date, hour, minute, second] = civil_digits(s)?;
+    let calendar = *CALENDAR[year as usize].get(month as usize)?;
+    if date == 0 || date > (calendar & 31) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-
-    let year = year - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let march_month = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * march_month + 2) / 5 + date - 1;
-    let days = era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100
-        + day_of_year
-        - 719_468;
-    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * 1000 - offset)
+    let days = i64::from((calendar >> 5) + date - 1);
+    let seconds = (hour * 60 + minute) * 60 + second - offset;
+    Some(days * DAY + i64::from(seconds) * 1000)
 }
 
 #[derive(Clone, Copy)]
