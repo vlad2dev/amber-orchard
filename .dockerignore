@@ -1,5 +1,8 @@
-fixtures/
-dev/
-out/
-*.md
+.dockerignore
 .git
+.venv
+dev
+fixtures
+out
+target
+*.md

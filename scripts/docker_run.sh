@@ -10,13 +10,22 @@ DATA=$(cd "$1" && pwd)
 mkdir -p "$2"; OUT=$(cd "$2" && pwd)
 SCRATCH=$(mktemp -d)
 chmod 777 "$OUT" "$SCRATCH"
+DATA_MOUNT=$DATA
+OUT_MOUNT=$OUT
+SCRATCH_MOUNT=$SCRATCH
+if command -v cygpath >/dev/null 2>&1; then
+  DATA_MOUNT=$(cygpath -am "$DATA")
+  OUT_MOUNT=$(cygpath -am "$OUT")
+  SCRATCH_MOUNT=$(cygpath -am "$SCRATCH")
+  export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+fi
 # The run's files belong to uid 1000, as on the scorer. If that is not you (a
 # Linux user other than the first, a cloud VM, rootless Docker), you could not
 # delete them, so they are made writable for everyone before cleaning up.
 release() {
   if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
     docker run --rm --platform "$PLATFORM" --network none --user 1000:1000 \
-      -v "$OUT":/output:z -v "$SCRATCH":/scratch:z --entrypoint chmod "$IMAGE" \
+      -v "$OUT_MOUNT":/output:z -v "$SCRATCH_MOUNT":/scratch:z --entrypoint chmod "$IMAGE" \
       -R a+rwX /output /scratch >/dev/null 2>&1 || true
   fi
   rm -rf "$SCRATCH" 2>/dev/null || true
@@ -27,7 +36,7 @@ docker run --rm --platform "$PLATFORM" \
   --cap-drop ALL --security-opt no-new-privileges \
   --pids-limit 4096 --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" \
   --user 1000:1000 \
-  -v "$DATA":/data:ro,z -v "$OUT":/output:z -v "$SCRATCH":/scratch:z \
+  -v "$DATA_MOUNT":/data:ro,z -v "$OUT_MOUNT":/output:z -v "$SCRATCH_MOUNT":/scratch:z \
   -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch \
   -e NCPU="${CPUS%.*}" -e MEM_GB="${MEM%g}" \
   "$IMAGE"
