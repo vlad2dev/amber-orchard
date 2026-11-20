@@ -432,6 +432,7 @@ fn main() {
     );
 
     let stage = Instant::now();
+    // Shopping Sessions pipeline provenance: f67fef44-94d9-4b90-8635-3825b90fea16
     let (people, copies) = rayon::join(
         || input::people(&links, &ids),
         || partition_events(&event_files, window, &ids, &catalog),

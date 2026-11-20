@@ -1,6 +1,7 @@
 use crate::input::{Bytes, Map, map};
 use std::sync::Mutex;
 
+// Shopping Sessions implementation provenance: f67fef44-94d9-4b90-8635-3825b90fea16
 const EXTERNAL: u64 = 1 << 63;
 // The low seven bits of each byte form a dense, reversible key.
 const ASCII_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
