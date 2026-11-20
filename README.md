@@ -112,3 +112,43 @@ variation, especially for the first baseline run.
 
 Each `compare.py` run reported zero rows unique to either side and zero
 duplicate keys for both tables.
+
+## Compact ID benchmark
+
+The optimization uses reversible 64-bit keys for short ASCII identifiers.
+Long strings, non-ASCII strings, and strings with a NUL byte use a separate
+exact index. Link minima and tied click IDs still compare the original bytes.
+The pipeline resolves links alongside event parsing, then applies the canonical
+ID to each surviving event after deduplication. ISO timestamps use SIMD digit
+decoding and a Gregorian month table covering every four-digit year.
+
+Same generated seed 19 (20M events, 5M clicks), eight Docker vCPUs, local Linux
+volume for input and tmpfs for output:
+
+| Image | In-process time | Docker CLI wall time |
+| --- | ---: | ---: |
+| Prior AVX2 parser | 3.591 s | 4.439 s |
+| Compact IDs, serial link setup | 1.460 s | 1.869 s |
+| Compact IDs, overlapped link setup (best) | 1.113 s | 1.537 s |
+| Compact IDs, overlapped link setup (another run) | 1.219 s | 1.630 s |
+
+The overlapped build took 6.006 s wall time under the Windows bind-mount
+launcher. It passed all 36 fixtures and matched the official dev answer,
+the Python oracle for seeds 7 and 11, and the earlier baseline at 20M events.
+Both Rust unit tests passed. Pre-sizing event buckets did not produce a
+consistent total-runtime gain, so the branch keeps dynamic bucket capacities.
+
+To reproduce the Linux-volume timing from Git Bash with the generated
+`big19` data and the optimized Docker image:
+
+```sh
+DATA_ABS=$(cd ../ss-data/big19 && pwd -W)
+MSYS_NO_PATHCONV=1 docker volume create ss-seed19-local
+MSYS_NO_PATHCONV=1 docker run --rm -v "$DATA_ABS:/source:ro" \
+  -v ss-seed19-local:/data debian:bookworm-slim cp -r /source/. /data/
+time MSYS_NO_PATHCONV=1 docker run --rm --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
+  --cpus 8 --memory 24g --memory-swap 24g --user 1000:1000 \
+  --tmpfs /tmp:rw,size=64m,mode=1777 --tmpfs /output:rw,size=128m,mode=1777 \
+  -v ss-seed19-local:/data:ro shopping-sessions:latest
+```
