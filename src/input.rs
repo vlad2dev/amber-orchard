@@ -1,3 +1,4 @@
+use crate::ids::{Id, Ids};
 use ahash::RandomState;
 use memchr::memchr;
 use memmap2::{Mmap, MmapOptions};
@@ -19,7 +20,7 @@ pub fn map<K, V>() -> Map<K, V> {
     HashMap::with_hasher(HASH.clone())
 }
 
-pub fn bucket(key: &[u8]) -> usize {
+pub fn bucket(key: impl std::hash::Hash) -> usize {
     HASH.hash_one(key) as usize & (BUCKETS - 1)
 }
 
@@ -360,25 +361,41 @@ fn root(parents: &mut [usize], mut node: usize) -> usize {
     node
 }
 
-pub fn people(files: &[Mmap]) -> Map<Bytes<'_>, Bytes<'_>> {
+pub struct LinkedIds {
+    indices: Map<Id, usize>,
+    names: Vec<Id>,
+}
+
+impl LinkedIds {
+    #[inline]
+    pub fn name(&self, id: Id) -> Id {
+        self.indices.get(&id).map_or(id, |&index| self.names[index])
+    }
+}
+
+pub fn people<'a>(files: &'a [Mmap], ids: &Ids<'a>) -> LinkedIds {
     let edges: Vec<Vec<_>> = chunks(files)
         .into_par_iter()
         .map(|chunk| {
             records::<2>(chunk)
                 .filter(|[a, b]| !a.is_empty() && !b.is_empty())
+                .map(|[a, b]| [(ids.key(a), a), (ids.key(b), b)])
                 .collect()
         })
         .collect();
-    let mut ids = map();
-    let mut names = Vec::new();
-    let mut parents = Vec::new();
-    let mut sizes = Vec::new();
+    let edge_count = edges.iter().map(Vec::len).sum::<usize>();
+    let capacity = edge_count + edge_count / 2;
+    let mut indices = map();
+    indices.reserve(capacity);
+    let mut names = Vec::with_capacity(capacity);
+    let mut parents = Vec::with_capacity(capacity);
+    let mut sizes = Vec::with_capacity(capacity);
     for [a, b] in edges.into_iter().flatten() {
-        let mut intern = |id| {
-            *ids.entry(id).or_insert_with(|| {
+        let mut intern = |name: (Id, Bytes<'a>)| {
+            *indices.entry(name.0).or_insert_with(|| {
                 let index = parents.len();
                 parents.push(index);
-                names.push(id);
+                names.push(name);
                 sizes.push(1);
                 index
             })
@@ -393,12 +410,15 @@ pub fn people(files: &[Mmap]) -> Map<Bytes<'_>, Bytes<'_>> {
             }
             parents[b] = a;
             sizes[a] += sizes[b];
-            names[a] = names[a].min(names[b]);
+            if names[b].1 < names[a].1 {
+                names[a] = names[b];
+            }
         }
     }
-    ids.into_iter()
-        .map(|(id, index)| (id, names[root(&mut parents, index)]))
-        .collect()
+    let names = (0..parents.len())
+        .map(|index| names[root(&mut parents, index)].0)
+        .collect();
+    LinkedIds { indices, names }
 }
 
 pub type Partitions<T> = [Vec<T>; BUCKETS];

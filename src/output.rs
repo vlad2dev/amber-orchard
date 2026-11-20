@@ -47,7 +47,12 @@ fn write(path: &Path, columns: &[(&str, DataType, bool)], arrays: Vec<ArrayRef>)
     writer.close().expect("close parquet");
 }
 
-pub fn write_users(folder: &Path, partition: usize, rows: &[UserTotals]) {
+pub fn write_users(folder: &Path, partition: usize, rows: &[UserTotals], ids: &crate::ids::Ids) {
+    let mut names = arrow_array::builder::StringBuilder::with_capacity(rows.len(), rows.len() * 9);
+    let mut buffer = [0; 9];
+    for row in rows {
+        names.append_value(string(ids.bytes(row.person, &mut buffer)));
+    }
     use DataType::{Date32, Int64, Utf8};
     write(
         &folder.join(format!("part-{partition:03}.parquet")),
@@ -60,7 +65,7 @@ pub fn write_users(folder: &Path, partition: usize, rows: &[UserTotals]) {
             ("top_category", Utf8, true),
         ],
         vec![
-            text(rows.iter().map(|row| Some(row.person))),
+            Arc::new(names.finish()),
             dates(rows.iter().map(|row| row.day)),
             ints(rows.iter().map(|row| row.sessions)),
             ints(rows.iter().map(|row| row.events)),

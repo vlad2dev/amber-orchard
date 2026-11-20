@@ -1,9 +1,11 @@
+mod ids;
 mod input;
 mod output;
 
+use ids::{Id, Ids};
 use input::{
-    Bytes, DAY, Map, Partitions, WEEK, Window, bucket, chunks, dictionary, map, mappings, number,
-    partition, records, timestamp, transpose,
+    Bytes, DAY, LinkedIds, Map, Partitions, WEEK, Window, bucket, chunks, dictionary, map,
+    mappings, number, partition, records, timestamp, transpose,
 };
 use rayon::prelude::*;
 use std::fs;
@@ -11,21 +13,21 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
-struct Event<'a> {
-    person: Bytes<'a>,
+struct Event {
+    person: Id,
     ts: i64,
     cents: u32,
     category: u32,
 }
 
-struct CopyEvent<'a> {
+struct CopyEvent {
     ingest: i64,
-    event: Event<'a>,
+    event: Event,
 }
 
 #[derive(Clone, Copy)]
 struct Click<'a> {
-    person: Bytes<'a>,
+    person: Id,
     id: Bytes<'a>,
     ts: i64,
     campaign: usize,
@@ -76,9 +78,9 @@ fn parse_event<'a>(
     [_, user, ts, _, kind, product, price]: [Bytes<'a>; 7],
     ingest: i64,
     window: Window,
-    people: &Map<Bytes<'a>, Bytes<'a>>,
+    ids: &Ids<'a>,
     catalog: &Catalog,
-) -> Option<Event<'a>> {
+) -> Option<Event> {
     if user.is_empty() || product.is_empty() {
         return None;
     }
@@ -97,8 +99,9 @@ fn parse_event<'a>(
     if !(window.start..window.end).contains(&ts) || ingest - ts > DAY {
         return None;
     }
+    let user = ids.key(user);
     Some(Event {
-        person: people.get(user).copied().unwrap_or(user),
+        person: user,
         ts,
         cents,
         category: if cents == 0 {
@@ -109,14 +112,13 @@ fn parse_event<'a>(
     })
 }
 
-fn read_events<'a>(
+fn partition_events<'a>(
     files: &'a [memmap2::Mmap],
     window: Window,
-    people: &Map<Bytes<'a>, Bytes<'a>>,
+    ids: &Ids<'a>,
     catalog: &Catalog,
-) -> Vec<Vec<Vec<Event<'a>>>> {
-    let start = Instant::now();
-    let groups: Vec<_> = chunks(files)
+) -> Vec<Partitions<(Id, CopyEvent)>> {
+    chunks(files)
         .into_par_iter()
         .map(|chunk| {
             let mut buckets = partition();
@@ -125,9 +127,10 @@ fn read_events<'a>(
                 if id.is_empty() {
                     continue;
                 }
+                let id = ids.key(id);
                 let ingest = timestamp(row[3]).expect("valid ingest timestamp");
-                let event = parse_event(row, ingest, window, people, catalog).unwrap_or(Event {
-                    person: b"",
+                let event = parse_event(row, ingest, window, ids, catalog).unwrap_or(Event {
+                    person: Id::default(),
                     ts: 0,
                     cents: 0,
                     category: 0,
@@ -136,12 +139,13 @@ fn read_events<'a>(
             }
             buckets
         })
-        .collect();
-    eprintln!(
-        "event parse and partition: {:.3}s",
-        start.elapsed().as_secs_f64()
-    );
+        .collect()
+}
 
+fn dedup_events(
+    groups: Vec<Partitions<(Id, CopyEvent)>>,
+    people: &LinkedIds,
+) -> Vec<Vec<Vec<Event>>> {
     let start = Instant::now();
     let groups: Vec<Partitions<Event>> = transpose(groups)
         .into_par_iter()
@@ -160,7 +164,9 @@ fn read_events<'a>(
             let mut partitions = partition();
             for copy in earliest.into_values() {
                 if !copy.event.person.is_empty() {
-                    partitions[bucket(copy.event.person)].push(copy.event);
+                    let mut event = copy.event;
+                    event.person = people.name(event.person);
+                    partitions[bucket(event.person)].push(event);
                 }
             }
             partitions
@@ -176,7 +182,8 @@ fn read_events<'a>(
 fn read_clicks<'a>(
     files: &'a [memmap2::Mmap],
     window: Window,
-    people: &Map<Bytes<'a>, Bytes<'a>>,
+    people: &LinkedIds,
+    ids: &Ids<'a>,
     catalog: &Catalog,
 ) -> Vec<Vec<Vec<Click<'a>>>> {
     let groups: Vec<_> = chunks(files)
@@ -194,7 +201,8 @@ fn read_clicks<'a>(
                 if !(window.start - WEEK..window.end).contains(&ts) {
                     continue;
                 }
-                let person = people.get(user).copied().unwrap_or(user);
+                let user = ids.key(user);
+                let person = people.name(user);
                 partitions[bucket(person)].push(Click {
                     person,
                     id,
@@ -220,7 +228,7 @@ type CampaignDays = Map<i32, Vec<CampaignTotals>>;
 
 #[derive(Default)]
 struct UserTotals<'a> {
-    person: Bytes<'a>,
+    person: Id,
     day: i32,
     sessions: i64,
     events: i64,
@@ -298,17 +306,17 @@ fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
 }
 
 fn summarize<'a>(
-    event_groups: Vec<Vec<Event<'a>>>,
+    event_groups: Vec<Vec<Event>>,
     click_groups: Vec<Vec<Click<'a>>>,
     catalog: &Catalog<'a>,
 ) -> (Vec<UserTotals<'a>>, CampaignDays) {
     let mut events = flatten(event_groups);
     let mut clicks = flatten(click_groups);
-    events.sort_unstable_by(|a, b| a.person.cmp(b.person).then(a.ts.cmp(&b.ts)));
+    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
     // The last click in a timestamp tie has the smallest click ID.
     clicks.sort_unstable_by(|a, b| {
         a.person
-            .cmp(b.person)
+            .cmp(&b.person)
             .then(a.ts.cmp(&b.ts))
             .then_with(|| b.id.cmp(a.id))
     });
@@ -415,13 +423,26 @@ fn main() {
     let campaigns = fs::read(data.join("campaigns.csv")).expect("read campaigns");
     let catalog = Catalog::new(&products, &campaigns);
     let links = mappings(&data.join("links"));
-    let people = input::people(&links);
+    let ids = Ids::new();
     let event_files = mappings(&data.join("events"));
     let click_files = mappings(&data.join("clicks"));
-    eprintln!("catalog and links: {:.3}s", begin.elapsed().as_secs_f64());
-    let events = read_events(&event_files, window, &people, &catalog);
+    eprintln!(
+        "catalog and input maps: {:.3}s",
+        begin.elapsed().as_secs_f64()
+    );
+
     let stage = Instant::now();
-    let clicks = read_clicks(&click_files, window, &people, &catalog);
+    let (people, copies) = rayon::join(
+        || input::people(&links, &ids),
+        || partition_events(&event_files, window, &ids, &catalog),
+    );
+    eprintln!(
+        "links and event parse: {:.3}s",
+        stage.elapsed().as_secs_f64()
+    );
+    let events = dedup_events(copies, &people);
+    let stage = Instant::now();
+    let clicks = read_clicks(&click_files, window, &people, &ids, &catalog);
     eprintln!(
         "click parse and partition: {:.3}s",
         stage.elapsed().as_secs_f64()
@@ -437,13 +458,13 @@ fn main() {
         .map(|(index, (events, clicks))| {
             let (rows, campaigns) = summarize(events, clicks, &catalog);
             if !rows.is_empty() {
-                output::write_users(&user_folder, index, &rows);
+                output::write_users(&user_folder, index, &rows, &ids);
             }
             (rows.len(), campaigns)
         })
         .collect();
     if results.iter().all(|(count, _)| *count == 0) {
-        output::write_users(&user_folder, 0, &[]);
+        output::write_users(&user_folder, 0, &[], &ids);
     }
     let mut campaigns = CampaignDays::default();
     for (_, partition) in results {
