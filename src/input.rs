@@ -80,7 +80,81 @@ pub fn records<const N: usize>(chunk: &[u8]) -> impl Iterator<Item = [Bytes<'_>;
         })
 }
 
+// Expected input rows fit in two 128-bit delimiter masks. Longer rows use the
+// same dialect via the portable scanner, with no limit on field or row length.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
 fn fields<const N: usize>(line: &[u8]) -> Option<[Bytes<'_>; N]> {
+    use std::arch::x86_64::*;
+
+    if !(32..=128).contains(&line.len()) {
+        return scalar_fields(line);
+    }
+
+    #[inline]
+    fn masks(block: &[u8], offset: usize) -> (u32, u32) {
+        // Every caller passes an offset with at least 32 readable bytes. The
+        // Docker target enables AVX2, and loadu accepts unaligned addresses.
+        unsafe {
+            let bytes = _mm256_loadu_si256(block.as_ptr().add(offset).cast());
+            let commas = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8));
+            let quotes = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8));
+            (
+                _mm256_movemask_epi8(commas) as u32,
+                _mm256_movemask_epi8(quotes) as u32,
+            )
+        }
+    }
+
+    let (first_commas, first_quotes) = masks(line, 0);
+    let mut commas = u128::from(first_commas);
+    let mut quotes = u128::from(first_quotes);
+    let mut offset = 32;
+    while offset + 32 <= line.len() {
+        let (more_commas, more_quotes) = masks(line, offset);
+        commas |= u128::from(more_commas) << offset;
+        quotes |= u128::from(more_quotes) << offset;
+        offset += 32;
+    }
+    if offset < line.len() {
+        // The final vector overlaps the previous one. ORing its mask keeps
+        // each delimiter at its original byte index.
+        let offset = line.len() - 32;
+        let (last_commas, last_quotes) = masks(line, offset);
+        commas |= u128::from(last_commas) << offset;
+        quotes |= u128::from(last_quotes) << offset;
+    }
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+
+    let mut result: [Bytes<'_>; N] = [&[]; N];
+    let mut start = 0;
+    for (index, field) in result.iter_mut().enumerate() {
+        let end = if index + 1 == N {
+            line.len()
+        } else {
+            let comma = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            comma
+        };
+        let raw = &line[start..end];
+        *field = if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
+            quotes ^= (1_u128 << start) | (1_u128 << (end - 1));
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        start = end + 1;
+    }
+    // Quotes anywhere other than the two boundaries of a field are malformed.
+    (quotes == 0).then_some(result)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+use scalar_fields as fields;
+
+fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[Bytes<'_>; N]> {
     let mut commas = memchr::memchr_iter(b',', line);
     let mut fields: [Bytes<'_>; N] = [&[]; N];
     let mut start = 0;
@@ -272,4 +346,39 @@ pub fn transpose<T>(groups: Vec<Partitions<T>>) -> Vec<Vec<Vec<T>>> {
         }
     }
     buckets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fields, scalar_fields};
+
+    #[test]
+    fn delimiter_masks_match_scalar_scan() {
+        // Sweep the separator, leading/trailing quotes and CR across vector
+        // boundaries, including the overlap in a partial final block.
+        for length in 0..=160 {
+            for comma in 0..length {
+                for quoted in [false, true] {
+                    let mut line = vec![b'x'; length];
+                    line[comma] = b',';
+                    if quoted && comma >= 2 {
+                        line[0] = b'"';
+                        line[comma - 1] = b'"';
+                    }
+                    assert_eq!(fields::<2>(&line), scalar_fields::<2>(&line));
+                    for stray in [0, 31, 32, 63, 64, 95, 96, 127, length - 1] {
+                        if stray >= length || stray == comma {
+                            continue;
+                        }
+                        let old = line[stray];
+                        for byte in [b'"', b',', b'\r'] {
+                            line[stray] = byte;
+                            assert_eq!(fields::<2>(&line), scalar_fields::<2>(&line));
+                        }
+                        line[stray] = old;
+                    }
+                }
+            }
+        }
+    }
 }
