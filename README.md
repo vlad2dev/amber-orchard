@@ -152,3 +152,26 @@ time MSYS_NO_PATHCONV=1 docker run --rm --network none --read-only \
   --tmpfs /tmp:rw,size=64m,mode=1777 --tmpfs /output:rw,size=128m,mode=1777 \
   -v ss-seed19-local:/data:ro shopping-sessions:latest
 ```
+
+## Official one-second target
+
+The previous branch was reported at 1.95 s on the official scorer. This branch
+reduces event-record traffic through packed payloads and contiguous dedup
+winners, scans line endings and delimiters in one AVX2 pass, and enables AES
+hashing for the Intel scorer CPUs. It retains the wide event format for large
+manifest windows and category catalogs.
+
+On the same local seed 19 Linux-volume test described above, three sequential
+runs of the selected image produced in-process times of 0.938, 1.016, and
+0.975 s, with Docker CLI wall times of 1.403, 1.526, and 1.473 s. The fused
+scanner without AES had a 1.017 s process median in the same comparison.
+Larger event buckets, per-person grouping, a linked-person cache, and concurrent
+dedup and click parsing did not deliver a consistent total-time improvement.
+
+The selected AES image passed all 36 fixtures and all three Rust unit tests.
+It matched the official dev answer, the independent Python oracle for seeds 7
+and 11, the previous 20M-event result, and an extra Python oracle case with a
+31-day window and 513 product categories. The 20M check matched 2,236,911 user
+rows and 28,014 campaign rows with zero differences or duplicate keys.
+
+The optimized build's official runtime still requires a scorer run.
