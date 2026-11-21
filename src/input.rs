@@ -67,68 +67,72 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
     chunks
 }
 
-pub fn records<const N: usize>(chunk: &[u8]) -> impl Iterator<Item = [Bytes<'_>; N]> {
-    let mut start = 0;
-    memchr::memchr_iter(b'\n', chunk)
-        .chain(std::iter::once(chunk.len()))
-        .filter_map(move |end| {
-            if start > end {
-                return None;
+pub fn records<const N: usize>(mut chunk: &[u8]) -> impl Iterator<Item = [Bytes<'_>; N]> {
+    std::iter::from_fn(move || {
+        while !chunk.is_empty() {
+            let (consumed, row) = scan::<N>(chunk);
+            chunk = &chunk[consumed..];
+            if row.is_some() {
+                return row;
             }
-            let line = &chunk[start..end];
-            start = end + 1;
-            fields(line)
-        })
+        }
+        None
+    })
 }
 
-// Expected input rows fit in two 128-bit delimiter masks. Longer rows use the
-// same dialect via the portable scanner, with no limit on field or row length.
+#[inline]
+fn scan<const N: usize>(input: &[u8]) -> (usize, Option<[Bytes<'_>; N]>) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if N >= 4 && input.len() >= 128 {
+        use std::arch::x86_64::*;
+        let mut commas = 0_u128;
+        let mut quotes = 0_u128;
+        for offset in [0, 32, 64, 96] {
+            // The length check above guarantees a readable 32-byte block.
+            let (newlines, separators, delimiters) = unsafe {
+                let bytes = _mm256_loadu_si256(input.as_ptr().add(offset).cast());
+                (
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8)))
+                        as u32,
+                )
+            };
+            if newlines != 0 {
+                let end = newlines.trailing_zeros();
+                let keep = (1_u32 << end) - 1;
+                commas |= u128::from(separators & keep) << offset;
+                quotes |= u128::from(delimiters & keep) << offset;
+                let end = offset + end as usize;
+                return (end + 1, masked_fields(&input[..end], commas, quotes));
+            }
+            commas |= u128::from(separators) << offset;
+            quotes |= u128::from(delimiters) << offset;
+        }
+        let end = memchr(b'\n', &input[128..]).map_or(input.len(), |offset| offset + 128);
+        return ((end + 1).min(input.len()), scalar_fields(&input[..end]));
+    }
+
+    let end = memchr(b'\n', input).unwrap_or(input.len());
+    ((end + 1).min(input.len()), scalar_fields(&input[..end]))
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
-fn fields<const N: usize>(line: &[u8]) -> Option<[Bytes<'_>; N]> {
-    use std::arch::x86_64::*;
-
-    if !(32..=128).contains(&line.len()) {
-        return scalar_fields(line);
-    }
-
-    #[inline]
-    fn masks(block: &[u8], offset: usize) -> (u32, u32) {
-        // Every caller passes an offset with at least 32 readable bytes. The
-        // Docker target enables AVX2, and loadu accepts unaligned addresses.
-        unsafe {
-            let bytes = _mm256_loadu_si256(block.as_ptr().add(offset).cast());
-            let commas = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8));
-            let quotes = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8));
-            (
-                _mm256_movemask_epi8(commas) as u32,
-                _mm256_movemask_epi8(quotes) as u32,
-            )
-        }
-    }
-
-    let (first_commas, first_quotes) = masks(line, 0);
-    let mut commas = u128::from(first_commas);
-    let mut quotes = u128::from(first_quotes);
-    let mut offset = 32;
-    while offset + 32 <= line.len() {
-        let (more_commas, more_quotes) = masks(line, offset);
-        commas |= u128::from(more_commas) << offset;
-        quotes |= u128::from(more_quotes) << offset;
-        offset += 32;
-    }
-    if offset < line.len() {
-        // The final vector overlaps the previous one. ORing its mask keeps
-        // each delimiter at its original byte index.
-        let offset = line.len() - 32;
-        let (last_commas, last_quotes) = masks(line, offset);
-        commas |= u128::from(last_commas) << offset;
-        quotes |= u128::from(last_quotes) << offset;
-    }
-    if commas.count_ones() as usize != N - 1 {
+fn masked_fields<const N: usize>(
+    line: &[u8],
+    mut commas: u128,
+    quotes: u128,
+) -> Option<[Bytes<'_>; N]> {
+    if line.is_empty() {
         return None;
     }
-
+    let boundaries = (commas << 1) | (commas >> 1) | 1 | (1_u128 << (line.len() - 1));
+    if commas.count_ones() as usize != N - 1 || quotes & !boundaries != 0 {
+        return None;
+    }
     let mut result: [Bytes<'_>; N] = [&[]; N];
     let mut start = 0;
     for (index, field) in result.iter_mut().enumerate() {
@@ -140,20 +144,17 @@ fn fields<const N: usize>(line: &[u8]) -> Option<[Bytes<'_>; N]> {
             comma
         };
         let raw = &line[start..end];
-        *field = if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' {
-            quotes ^= (1_u128 << start) | (1_u128 << (end - 1));
-            &raw[1..raw.len() - 1]
-        } else {
-            raw
-        };
+        let leading = raw.first() == Some(&b'"');
+        let trailing = raw.last() == Some(&b'"');
+        let trim = usize::from(leading);
+        if leading != trailing || raw.len() < 2 * trim {
+            return None;
+        }
+        *field = &raw[trim..raw.len() - trim];
         start = end + 1;
     }
-    // Quotes anywhere other than the two boundaries of a field are malformed.
-    (quotes == 0).then_some(result)
+    Some(result)
 }
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-use scalar_fields as fields;
 
 fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[Bytes<'_>; N]> {
     let mut commas = memchr::memchr_iter(b',', line);
@@ -353,6 +354,100 @@ impl Window {
     }
 }
 
+// Fixed-width UTC ingest strings sort in chronological order. For small
+// windows, keep this order key and compare against precomputed next-day dates.
+pub struct IngestOrder {
+    first_day: i64,
+    next_dates: Vec<i64>,
+}
+
+impl IngestOrder {
+    pub fn new(window: Window) -> Self {
+        let first_day = window.start.div_euclid(DAY);
+        let last_day = window.end.div_euclid(DAY);
+        let mut next_dates = Vec::new();
+        if (0..=4096).contains(&(last_day - first_day))
+            && first_day + 1 >= i64::from(month_start(0, 1))
+            && last_day + 1 < i64::from(month_start(10_000, 1))
+        {
+            for next_day in first_day + 1..=last_day + 1 {
+                let year =
+                    CALENDAR.partition_point(|months| i64::from(months[1] >> 5) <= next_day) - 1;
+                let months = &CALENDAR[year][1..];
+                let month = months.partition_point(|start| i64::from(start >> 5) <= next_day);
+                let day = next_day - i64::from(months[month - 1] >> 5) + 1;
+                next_dates.push(
+                    (bcd(year as i64 / 100) << 24)
+                        | (bcd(year as i64 % 100) << 16)
+                        | (bcd(month as i64) << 8)
+                        | bcd(day),
+                );
+            }
+        }
+        Self {
+            first_day,
+            next_dates,
+        }
+    }
+
+    #[inline]
+    pub fn key(&self, s: &[u8]) -> i64 {
+        if self.next_dates.is_empty() {
+            return timestamp(s).expect("valid ingest timestamp");
+        }
+        // The specification guarantees an F1 ingest timestamp on every
+        // well-formed event row. Pack only its digits, preserving their order.
+        let prefix = u64::from_be_bytes(s[..8].try_into().expect("valid ingest timestamp"));
+        let middle = u64::from_be_bytes(s[8..16].try_into().expect("valid ingest timestamp"));
+        let date = compress_digits(prefix, 0x0f0f_0f0f_000f_0f00);
+        let time = compress_digits(middle, 0x0f0f_000f_0f00_0f0f);
+        ((date << 32) | (time << 8) | (u64::from(s[17] & 15) << 4) | u64::from(s[18] & 15)) as i64
+    }
+
+    #[inline]
+    pub fn is_late(&self, key: i64, ts: i64) -> bool {
+        if self.next_dates.is_empty() {
+            return key - ts > DAY;
+        }
+        let day = ts.div_euclid(DAY);
+        let next_date = self.next_dates[(day - self.first_day) as usize];
+        let ingest_date = key >> 24;
+        if ingest_date != next_date {
+            return ingest_date > next_date;
+        }
+        // An ingest timestamp has whole seconds. Comparing to the floor
+        // of the threshold gives the same strict comparison at millisecond precision.
+        let seconds = ts.rem_euclid(DAY) / 1000;
+        let threshold =
+            (bcd(seconds / 3600) << 16) | (bcd(seconds / 60 % 60) << 8) | bcd(seconds % 60);
+        key & 0xff_ffff > threshold
+    }
+}
+
+#[inline]
+fn bcd(value: i64) -> i64 {
+    ((value / 10) << 4) | value % 10
+}
+
+#[inline]
+fn compress_digits(bytes: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // BMI2 is guaranteed by the image's CPU target.
+        unsafe { std::arch::x86_64::_pext_u64(bytes, mask) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut result = 0;
+        for shift in (0..8).rev().map(|byte| byte * 8) {
+            if mask >> shift & 15 != 0 {
+                result = (result << 4) | (bytes >> shift & 15);
+            }
+        }
+        result
+    }
+}
+
 fn root(parents: &mut [usize], mut node: usize) -> usize {
     while parents[node] != node {
         parents[node] = parents[parents[node]];
@@ -441,32 +536,69 @@ pub fn transpose<T>(groups: Vec<Partitions<T>>) -> Vec<Vec<Vec<T>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fields, scalar_fields};
+    use super::{scalar_fields, scan};
+
+    fn compare(line: &[u8]) {
+        let mut input = line.to_vec();
+        input.push(b'\n');
+        input.extend([b'"'; 128]);
+        let (consumed, parsed) = scan::<4>(&input);
+        assert_eq!(consumed, line.len() + 1);
+        assert_eq!(parsed, scalar_fields::<4>(line));
+    }
+
+    #[test]
+    fn fixed_width_ingest_keys_match_timestamp_order_and_lateness() {
+        use super::{DAY, IngestOrder, Window, timestamp};
+
+        let start = timestamp(b"1999-12-28T00:00:00Z").unwrap();
+        let end = timestamp(b"2000-03-04T00:00:00Z").unwrap();
+        let order = IngestOrder::new(Window { start, end });
+        let strings: &[&[u8]] = &[
+            b"1999-12-31T23:59:59Z",
+            b"2000-01-01T00:00:00Z",
+            b"2000-01-03T09:12:58Z",
+            b"2000-02-29T00:00:00Z",
+            b"2000-03-01T13:06:24Z",
+        ];
+        for pair in strings.windows(2) {
+            assert!(order.key(pair[0]) < order.key(pair[1]));
+        }
+        for text in strings {
+            let ingest = timestamp(text).unwrap();
+            let key = order.key(text);
+            for delta in [-DAY - 1, -DAY, -DAY + 1, -1, 0, 1] {
+                assert_eq!(order.is_late(key, ingest + delta), -delta > DAY);
+            }
+        }
+
+        let fallback = IngestOrder::new(Window { start: 0, end });
+        assert_eq!(fallback.key(strings[0]), timestamp(strings[0]).unwrap());
+    }
 
     #[test]
     fn delimiter_masks_match_scalar_scan() {
-        // Sweep the separator, leading/trailing quotes and CR across vector
-        // boundaries, including the overlap in a partial final block.
         for length in 0..=160 {
-            for comma in 0..length {
+            for separator in 0..length {
                 for quoted in [false, true] {
-                    let mut line = vec![b'x'; length];
-                    line[comma] = b',';
-                    if quoted && comma >= 2 {
-                        line[0] = b'"';
-                        line[comma - 1] = b'"';
+                    let mut line = b"a,b,".to_vec();
+                    line.extend(vec![b'x'; length]);
+                    line[separator + 4] = b',';
+                    if quoted && separator >= 2 {
+                        line[4] = b'"';
+                        line[separator + 3] = b'"';
                     }
-                    assert_eq!(fields::<2>(&line), scalar_fields::<2>(&line));
-                    for stray in [0, 31, 32, 63, 64, 95, 96, 127, length - 1] {
-                        if stray >= length || stray == comma {
+                    compare(&line);
+                    for position in [0, 31, 32, 63, 64, 95, 96, 127, length + 3] {
+                        if position >= line.len() || position == separator + 4 {
                             continue;
                         }
-                        let old = line[stray];
+                        let saved = line[position];
                         for byte in [b'"', b',', b'\r'] {
-                            line[stray] = byte;
-                            assert_eq!(fields::<2>(&line), scalar_fields::<2>(&line));
+                            line[position] = byte;
+                            compare(&line);
                         }
-                        line[stray] = old;
+                        line[position] = saved;
                     }
                 }
             }

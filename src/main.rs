@@ -1,28 +1,27 @@
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod event;
 mod ids;
 mod input;
 mod output;
 
+use event::{CopyEvent, Event, EventData, Packed, Wide};
 use ids::{Id, Ids};
 use input::{
-    Bytes, DAY, LinkedIds, Map, Partitions, WEEK, Window, bucket, chunks, dictionary, map,
-    mappings, number, partition, records, timestamp, transpose,
+    Bytes, DAY, IngestOrder, LinkedIds, Map, Partitions, WEEK, Window, bucket, chunks, dictionary,
+    map, mappings, number, partition, records, timestamp, transpose,
 };
 use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-#[derive(Clone, Copy)]
-struct Event {
-    person: Id,
-    ts: i64,
-    cents: u32,
-    category: u32,
-}
+static PROFILE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-struct CopyEvent {
-    ingest: i64,
-    event: Event,
+fn account(phase: usize, started: Instant) {
+    PROFILE[phase].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
 }
 
 #[derive(Clone, Copy)]
@@ -74,13 +73,14 @@ impl<'a> Catalog<'a> {
     }
 }
 
-fn parse_event<'a>(
+fn parse_event<'a, T: EventData>(
     [_, user, ts, _, kind, product, price]: [Bytes<'a>; 7],
     ingest: i64,
+    order: &IngestOrder,
     window: Window,
     ids: &Ids<'a>,
     catalog: &Catalog,
-) -> Option<Event> {
+) -> Option<Event<T>> {
     if user.is_empty() || product.is_empty() {
         return None;
     }
@@ -96,28 +96,28 @@ fn parse_event<'a>(
         _ => return None,
     };
     let ts = timestamp(ts)?;
-    if !(window.start..window.end).contains(&ts) || ingest - ts > DAY {
+    if !(window.start..window.end).contains(&ts) || order.is_late(ingest, ts) {
         return None;
     }
     let user = ids.key(user);
+    let category = if cents == 0 {
+        0
+    } else {
+        catalog.products.get(product).copied().unwrap_or(0)
+    };
     Some(Event {
         person: user,
-        ts,
-        cents,
-        category: if cents == 0 {
-            0
-        } else {
-            catalog.products.get(product).copied().unwrap_or(0)
-        },
+        data: T::encode(ts, cents, category, window.start),
     })
 }
 
-fn partition_events<'a>(
+fn partition_events<'a, T: EventData>(
     files: &'a [memmap2::Mmap],
     window: Window,
     ids: &Ids<'a>,
     catalog: &Catalog,
-) -> Vec<Partitions<(Id, CopyEvent)>> {
+) -> Vec<Partitions<(Id, CopyEvent<T>)>> {
+    let order = IngestOrder::new(window);
     chunks(files)
         .into_par_iter()
         .map(|chunk| {
@@ -128,13 +128,9 @@ fn partition_events<'a>(
                     continue;
                 }
                 let id = ids.key(id);
-                let ingest = timestamp(row[3]).expect("valid ingest timestamp");
-                let event = parse_event(row, ingest, window, ids, catalog).unwrap_or(Event {
-                    person: Id::default(),
-                    ts: 0,
-                    cents: 0,
-                    category: 0,
-                });
+                let ingest = order.key(row[3]);
+                let event =
+                    parse_event(row, ingest, &order, window, ids, catalog).unwrap_or_default();
                 buckets[bucket(id)].push((id, CopyEvent { ingest, event }));
             }
             buckets
@@ -142,27 +138,35 @@ fn partition_events<'a>(
         .collect()
 }
 
-fn dedup_events(
-    groups: Vec<Partitions<(Id, CopyEvent)>>,
+fn dedup_events<T: EventData>(
+    groups: Vec<Partitions<(Id, CopyEvent<T>)>>,
     people: &LinkedIds,
-) -> Vec<Vec<Vec<Event>>> {
+) -> Vec<Vec<Vec<Event<T>>>> {
     let start = Instant::now();
-    let groups: Vec<Partitions<Event>> = transpose(groups)
+    let groups: Vec<Partitions<Event<T>>> = transpose(groups)
         .into_par_iter()
         .map(|groups| {
-            let mut earliest = map();
-            earliest.reserve(groups.iter().map(Vec::len).sum());
+            let count = groups.iter().map(Vec::len).sum();
+            let mut index = map();
+            index.reserve(count);
+            let mut earliest: Vec<CopyEvent<T>> = Vec::with_capacity(count);
             for (id, copy) in groups.into_iter().flatten() {
-                let kept = earliest.entry(id).or_insert_with(|| CopyEvent {
-                    ingest: copy.ingest,
-                    event: copy.event,
-                });
-                if copy.ingest < kept.ingest {
-                    *kept = copy;
+                use std::collections::hash_map::Entry;
+                match index.entry(id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(earliest.len());
+                        earliest.push(copy);
+                    }
+                    Entry::Occupied(slot) => {
+                        let kept = &mut earliest[*slot.get()];
+                        if copy.ingest < kept.ingest {
+                            *kept = copy;
+                        }
+                    }
                 }
             }
             let mut partitions = partition();
-            for copy in earliest.into_values() {
+            for copy in earliest {
                 if !copy.event.person.is_empty() {
                     let mut event = copy.event;
                     event.person = people.name(event.person);
@@ -237,6 +241,8 @@ struct UserTotals<'a> {
 }
 
 struct ClickWindow {
+    winner_next: usize,
+    winner: usize,
     expired: usize,
     next: usize,
     active: Vec<usize>,
@@ -247,6 +253,8 @@ struct ClickWindow {
 impl ClickWindow {
     fn new(campaigns: usize) -> Self {
         Self {
+            winner_next: 0,
+            winner: 0,
             expired: 0,
             next: 0,
             active: Vec::new(),
@@ -258,6 +266,7 @@ impl ClickWindow {
     fn clear(&mut self) {
         self.expired = 0;
         self.next = 0;
+        self.winner_next = 0;
         for campaign in self.active.drain(..) {
             self.counts[campaign] = 0;
         }
@@ -290,7 +299,21 @@ impl ClickWindow {
             self.next += 1;
         }
         if self.expired < self.next {
-            clicks[self.next - 1].campaign
+            if self.winner_next != self.next {
+                let last = self.next - 1;
+                let mut best = &clicks[last];
+                for click in clicks[self.expired..last].iter().rev() {
+                    if click.ts != best.ts {
+                        break;
+                    }
+                    if click.id < best.id {
+                        best = click;
+                    }
+                }
+                self.winner = best.campaign;
+                self.winner_next = self.next;
+            }
+            self.winner
         } else {
             0
         }
@@ -305,23 +328,32 @@ fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
     all
 }
 
-fn summarize<'a>(
-    event_groups: Vec<Vec<Event>>,
+fn summarize<'a, T: EventData>(
+    event_groups: Vec<Vec<Event<T>>>,
+    origin: i64,
     click_groups: Vec<Vec<Click<'a>>>,
     catalog: &Catalog<'a>,
 ) -> (Vec<UserTotals<'a>>, CampaignDays) {
+    let tick = Instant::now();
     let mut events = flatten(event_groups);
     let mut clicks = flatten(click_groups);
-    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-    // The last click in a timestamp tie has the smallest click ID.
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.ts.cmp(&b.ts))
-            .then_with(|| b.id.cmp(a.id))
-    });
-    clicks.dedup_by(|a, b| a.person == b.person && a.ts == b.ts && a.id == b.id);
-
+    account(0, tick);
+    let tick = Instant::now();
+    // Group equal people before sorting their much smaller timestamp ranges.
+    events.sort_unstable_by_key(|event| event.person);
+    for person_events in events.chunk_by_mut(|a, b| a.person == b.person) {
+        person_events.sort_unstable_by_key(|event| event.data.time_key());
+    }
+    account(1, tick);
+    let tick = Instant::now();
+    // Identical copies enter and leave the window together. They preserve
+    // both the selected campaign and the set of assisting campaigns.
+    clicks.sort_unstable_by_key(|click| click.person);
+    for person_clicks in clicks.chunk_by_mut(|a, b| a.person == b.person) {
+        person_clicks.sort_unstable_by_key(|click| click.ts);
+    }
+    account(2, tick);
+    let tick = Instant::now();
     let mut users = Vec::new();
     let mut campaigns = map();
     let campaign_count = catalog.campaign_names.len();
@@ -346,8 +378,10 @@ fn summarize<'a>(
             ..UserTotals::default()
         };
         let mut best_category: Option<usize> = None;
-        for session in person_events.chunk_by(|a, b| b.ts - a.ts <= 1_800_000) {
-            let start = session[0].ts;
+        for session in
+            person_events.chunk_by(|a, b| b.data.time_key() - a.data.time_key() <= 1_800_000)
+        {
+            let start = session[0].data.timestamp(origin);
             let day = start.div_euclid(DAY) as i32;
             if user.sessions > 0 && user.day != day {
                 user.top_category = best_category.and_then(|index| catalog.categories[index]);
@@ -365,12 +399,16 @@ fn summarize<'a>(
             user.sessions += 1;
             user.events += session.len() as i64;
             let mut revenue = 0;
-            for event in session.iter().filter(|event| event.cents != 0) {
-                let category = event.category as usize;
+            for event in session
+                .iter()
+                .map(|event| event.data)
+                .filter(|data| data.cents() != 0)
+            {
+                let category = event.category();
                 if category_cents[category] == 0 {
                     used_categories.push(category);
                 }
-                let price = i64::from(event.cents);
+                let price = i64::from(event.cents());
                 category_cents[category] += price;
                 revenue += price;
                 if best_category.is_none_or(|best| {
@@ -401,6 +439,7 @@ fn summarize<'a>(
             category_cents[category] = 0;
         }
     }
+    account(3, tick);
     (users, campaigns)
 }
 
@@ -431,21 +470,59 @@ fn main() {
         begin.elapsed().as_secs_f64()
     );
 
+    if Packed::supports(window.start, window.end, catalog.categories.len()) {
+        run::<Packed>(
+            &out,
+            window,
+            &catalog,
+            &links,
+            &ids,
+            &event_files,
+            &click_files,
+        );
+    } else {
+        run::<Wide>(
+            &out,
+            window,
+            &catalog,
+            &links,
+            &ids,
+            &event_files,
+            &click_files,
+        );
+    }
+    eprintln!(
+        "total process: {:.3}s ({threads} threads)",
+        begin.elapsed().as_secs_f64()
+    );
+}
+
+fn run<'a, T: EventData>(
+    out: &Path,
+    window: Window,
+    catalog: &Catalog<'a>,
+    links: &'a [memmap2::Mmap],
+    ids: &Ids<'a>,
+    event_files: &'a [memmap2::Mmap],
+    click_files: &'a [memmap2::Mmap],
+) {
     let stage = Instant::now();
     // Shopping Sessions pipeline provenance: f67fef44-94d9-4b90-8635-3825b90fea16
     let (people, copies) = rayon::join(
-        || input::people(&links, &ids),
-        || partition_events(&event_files, window, &ids, &catalog),
+        || input::people(links, ids),
+        || partition_events::<T>(event_files, window, ids, catalog),
     );
     eprintln!(
         "links and event parse: {:.3}s",
         stage.elapsed().as_secs_f64()
     );
-    let events = dedup_events(copies, &people);
     let stage = Instant::now();
-    let clicks = read_clicks(&click_files, window, &people, &ids, &catalog);
+    let (events, clicks) = rayon::join(
+        || dedup_events(copies, &people),
+        || read_clicks(click_files, window, &people, ids, catalog),
+    );
     eprintln!(
-        "click parse and partition: {:.3}s",
+        "event dedup and click parse: {:.3}s",
         stage.elapsed().as_secs_f64()
     );
 
@@ -457,15 +534,17 @@ fn main() {
         .zip(clicks)
         .enumerate()
         .map(|(index, (events, clicks))| {
-            let (rows, campaigns) = summarize(events, clicks, &catalog);
+            let (rows, campaigns) = summarize(events, window.start, clicks, catalog);
             if !rows.is_empty() {
-                output::write_users(&user_folder, index, &rows, &ids);
+                let tick = Instant::now();
+                output::write_users(&user_folder, index, &rows, ids);
+                account(4, tick);
             }
             (rows.len(), campaigns)
         })
         .collect();
     if results.iter().all(|(count, _)| *count == 0) {
-        output::write_users(&user_folder, 0, &[], &ids);
+        output::write_users(&user_folder, 0, &[], ids);
     }
     let mut campaigns = CampaignDays::default();
     for (_, partition) in results {
@@ -481,14 +560,25 @@ fn main() {
             }
         }
     }
-    output::write_campaigns(&out, &catalog, campaigns);
+    let tick = Instant::now();
+    output::write_campaigns(out, catalog, campaigns);
+    account(5, tick);
+    for (label, counter) in [
+        "flatten",
+        "event sort",
+        "click sort",
+        "aggregation",
+        "user output",
+        "campaign output",
+    ]
+    .into_iter()
+    .zip(&PROFILE)
+    {
+        eprintln!("worker {label}: {:.3}s", counter.load(Relaxed) as f64 / 1e9);
+    }
     eprintln!(
         "sort, aggregate and write: {:.3}s",
         stage.elapsed().as_secs_f64()
-    );
-    eprintln!(
-        "total process: {:.3}s ({threads} threads)",
-        begin.elapsed().as_secs_f64()
     );
 }
 
