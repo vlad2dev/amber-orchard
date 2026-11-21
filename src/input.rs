@@ -354,6 +354,100 @@ impl Window {
     }
 }
 
+// Fixed-width UTC ingest strings sort in chronological order. For small
+// windows, keep this order key and compare against precomputed next-day dates.
+pub struct IngestOrder {
+    first_day: i64,
+    next_dates: Vec<i64>,
+}
+
+impl IngestOrder {
+    pub fn new(window: Window) -> Self {
+        let first_day = window.start.div_euclid(DAY);
+        let last_day = window.end.div_euclid(DAY);
+        let mut next_dates = Vec::new();
+        if (0..=4096).contains(&(last_day - first_day))
+            && first_day + 1 >= i64::from(month_start(0, 1))
+            && last_day + 1 < i64::from(month_start(10_000, 1))
+        {
+            for next_day in first_day + 1..=last_day + 1 {
+                let year =
+                    CALENDAR.partition_point(|months| i64::from(months[1] >> 5) <= next_day) - 1;
+                let months = &CALENDAR[year][1..];
+                let month = months.partition_point(|start| i64::from(start >> 5) <= next_day);
+                let day = next_day - i64::from(months[month - 1] >> 5) + 1;
+                next_dates.push(
+                    (bcd(year as i64 / 100) << 24)
+                        | (bcd(year as i64 % 100) << 16)
+                        | (bcd(month as i64) << 8)
+                        | bcd(day),
+                );
+            }
+        }
+        Self {
+            first_day,
+            next_dates,
+        }
+    }
+
+    #[inline]
+    pub fn key(&self, s: &[u8]) -> i64 {
+        if self.next_dates.is_empty() {
+            return timestamp(s).expect("valid ingest timestamp");
+        }
+        // The specification guarantees an F1 ingest timestamp on every
+        // well-formed event row. Pack only its digits, preserving their order.
+        let prefix = u64::from_be_bytes(s[..8].try_into().expect("valid ingest timestamp"));
+        let middle = u64::from_be_bytes(s[8..16].try_into().expect("valid ingest timestamp"));
+        let date = compress_digits(prefix, 0x0f0f_0f0f_000f_0f00);
+        let time = compress_digits(middle, 0x0f0f_000f_0f00_0f0f);
+        ((date << 32) | (time << 8) | (u64::from(s[17] & 15) << 4) | u64::from(s[18] & 15)) as i64
+    }
+
+    #[inline]
+    pub fn is_late(&self, key: i64, ts: i64) -> bool {
+        if self.next_dates.is_empty() {
+            return key - ts > DAY;
+        }
+        let day = ts.div_euclid(DAY);
+        let next_date = self.next_dates[(day - self.first_day) as usize];
+        let ingest_date = key >> 24;
+        if ingest_date != next_date {
+            return ingest_date > next_date;
+        }
+        // An ingest timestamp has whole seconds. Comparing to the floor
+        // of the threshold gives the same strict comparison at millisecond precision.
+        let seconds = ts.rem_euclid(DAY) / 1000;
+        let threshold =
+            (bcd(seconds / 3600) << 16) | (bcd(seconds / 60 % 60) << 8) | bcd(seconds % 60);
+        key & 0xff_ffff > threshold
+    }
+}
+
+#[inline]
+fn bcd(value: i64) -> i64 {
+    ((value / 10) << 4) | value % 10
+}
+
+#[inline]
+fn compress_digits(bytes: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // BMI2 is guaranteed by the image's CPU target.
+        unsafe { std::arch::x86_64::_pext_u64(bytes, mask) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut result = 0;
+        for shift in (0..8).rev().map(|byte| byte * 8) {
+            if mask >> shift & 15 != 0 {
+                result = (result << 4) | (bytes >> shift & 15);
+            }
+        }
+        result
+    }
+}
+
 fn root(parents: &mut [usize], mut node: usize) -> usize {
     while parents[node] != node {
         parents[node] = parents[parents[node]];
@@ -451,6 +545,35 @@ mod tests {
         let (consumed, parsed) = scan::<4>(&input);
         assert_eq!(consumed, line.len() + 1);
         assert_eq!(parsed, scalar_fields::<4>(line));
+    }
+
+    #[test]
+    fn fixed_width_ingest_keys_match_timestamp_order_and_lateness() {
+        use super::{DAY, IngestOrder, Window, timestamp};
+
+        let start = timestamp(b"1999-12-28T00:00:00Z").unwrap();
+        let end = timestamp(b"2000-03-04T00:00:00Z").unwrap();
+        let order = IngestOrder::new(Window { start, end });
+        let strings: &[&[u8]] = &[
+            b"1999-12-31T23:59:59Z",
+            b"2000-01-01T00:00:00Z",
+            b"2000-01-03T09:12:58Z",
+            b"2000-02-29T00:00:00Z",
+            b"2000-03-01T13:06:24Z",
+        ];
+        for pair in strings.windows(2) {
+            assert!(order.key(pair[0]) < order.key(pair[1]));
+        }
+        for text in strings {
+            let ingest = timestamp(text).unwrap();
+            let key = order.key(text);
+            for delta in [-DAY - 1, -DAY, -DAY + 1, -1, 0, 1] {
+                assert_eq!(order.is_late(key, ingest + delta), -delta > DAY);
+            }
+        }
+
+        let fallback = IngestOrder::new(Window { start: 0, end });
+        assert_eq!(fallback.key(strings[0]), timestamp(strings[0]).unwrap());
     }
 
     #[test]

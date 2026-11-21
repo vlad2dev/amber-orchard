@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod event;
 mod ids;
 mod input;
@@ -6,8 +9,8 @@ mod output;
 use event::{CopyEvent, Event, EventData, Packed, Wide};
 use ids::{Id, Ids};
 use input::{
-    Bytes, DAY, LinkedIds, Map, Partitions, WEEK, Window, bucket, chunks, dictionary, map,
-    mappings, number, partition, records, timestamp, transpose,
+    Bytes, DAY, IngestOrder, LinkedIds, Map, Partitions, WEEK, Window, bucket, chunks, dictionary,
+    map, mappings, number, partition, records, timestamp, transpose,
 };
 use rayon::prelude::*;
 use std::fs;
@@ -66,6 +69,7 @@ impl<'a> Catalog<'a> {
 fn parse_event<'a, T: EventData>(
     [_, user, ts, _, kind, product, price]: [Bytes<'a>; 7],
     ingest: i64,
+    order: &IngestOrder,
     window: Window,
     ids: &Ids<'a>,
     catalog: &Catalog,
@@ -85,7 +89,7 @@ fn parse_event<'a, T: EventData>(
         _ => return None,
     };
     let ts = timestamp(ts)?;
-    if !(window.start..window.end).contains(&ts) || ingest - ts > DAY {
+    if !(window.start..window.end).contains(&ts) || order.is_late(ingest, ts) {
         return None;
     }
     let user = ids.key(user);
@@ -106,6 +110,7 @@ fn partition_events<'a, T: EventData>(
     ids: &Ids<'a>,
     catalog: &Catalog,
 ) -> Vec<Partitions<(Id, CopyEvent<T>)>> {
+    let order = IngestOrder::new(window);
     chunks(files)
         .into_par_iter()
         .map(|chunk| {
@@ -116,8 +121,9 @@ fn partition_events<'a, T: EventData>(
                     continue;
                 }
                 let id = ids.key(id);
-                let ingest = timestamp(row[3]).expect("valid ingest timestamp");
-                let event = parse_event(row, ingest, window, ids, catalog).unwrap_or_default();
+                let ingest = order.key(row[3]);
+                let event =
+                    parse_event(row, ingest, &order, window, ids, catalog).unwrap_or_default();
                 buckets[bucket(id)].push((id, CopyEvent { ingest, event }));
             }
             buckets
@@ -475,11 +481,13 @@ fn run<'a, T: EventData>(
         "links and event parse: {:.3}s",
         stage.elapsed().as_secs_f64()
     );
-    let events = dedup_events(copies, &people);
     let stage = Instant::now();
-    let clicks = read_clicks(click_files, window, &people, ids, catalog);
+    let (events, clicks) = rayon::join(
+        || dedup_events(copies, &people),
+        || read_clicks(click_files, window, &people, ids, catalog),
+    );
     eprintln!(
-        "click parse and partition: {:.3}s",
+        "event dedup and click parse: {:.3}s",
         stage.elapsed().as_secs_f64()
     );
 
