@@ -175,3 +175,39 @@ and 11, the previous 20M-event result, and an extra Python oracle case with a
 rows and 28,014 campaign rows with zero differences or duplicate keys.
 
 The optimized build's official runtime still requires a scorer run.
+
+## Allocation and ingestion experiments
+
+The initial hypothesis was that a smaller dedup index and direct projection
+from SIMD quote masks could reduce cache traffic. The compact index, quote
+projection, high-byte radix presort, byte-balanced read batches, and streaming
+dedup each failed to show a consistent total runtime gain. The cache work was
+informed by [Swiss Tables](https://abseil.io/about/design/swisstables) and
+[Balkesen et al.](https://dbis.cs.tu-dortmund.de/en/publications/2013/main-memory-hash-joins/).
+The projection experiment followed the approach described in
+[Mison](https://www.microsoft.com/en-us/research/wp-content/uploads/2017/05/mison-vldb17.pdf).
+
+The retained build uses [mimalloc](https://www.microsoft.com/en-us/research/publication/mimalloc-free-list-sharding-in-action/)
+for cross-thread allocation, preserves ingest order with packed UTC digits,
+and overlaps click parsing with event deduplication. The timestamp order key
+uses precomputed next-day dates for bounded manifest windows and falls back
+to epoch milliseconds for wider windows. Ingest ordering and the strict
+24-hour cutoff were checked at leap-day and subsecond boundaries.
+
+The fixed inputs were generator seeds 19 and 29, each with 20M events and
+5M clicks. Both ran on an eight-vCPU Docker container with its inputs on a
+local Linux volume. Docker daemon timestamps measure start to exit. The
+Windows CLI wall timer includes the client, container setup, and cleanup.
+
+| Seed | Best daemon start-to-exit | Best single-command CLI wall |
+| --- | ---: | ---: |
+| 19 | 0.991 s | 1.429 s |
+| 29 | 0.999 s | 1.360 s |
+
+All 36 Docker fixtures and four Rust tests passed. The official dev answer,
+the seed 7 and 11 Python references, the wide-layout Python reference, and
+both 20M baseline comparisons returned `MATCH`. The 20M comparisons checked
+2,236,911 and 2,240,907 user rows and 28,014 campaign rows per seed.
+
+The original 1.20 s Windows CLI wall-time target is still open. An official
+scorer run is required to establish how the candidate ranks on the leaderboard.
