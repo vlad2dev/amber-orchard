@@ -92,9 +92,12 @@ fn scan<const N: usize>(input: &[u8]) -> (usize, Option<[Bytes<'_>; N]>) {
             let (newlines, separators, delimiters) = unsafe {
                 let bytes = _mm256_loadu_si256(input.as_ptr().add(offset).cast());
                 (
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8))) as u32,
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8))) as u32,
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))) as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8)))
+                        as u32,
                 )
             };
             if newlines != 0 {
